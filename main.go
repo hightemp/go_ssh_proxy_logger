@@ -124,7 +124,7 @@ func (s *Service) LogRequest(r *http.Request) error {
 	}
 	defer f.Close()
 
-	logEntry := fmt.Sprintf("[%s] Request to %s\n%s\n", timestamp, r.URL.String(), string(dump))
+	logEntry := fmt.Sprintf("[%s] Request to %s\n%s\n\n", timestamp, r.URL.String(), string(dump))
 	if _, err := f.WriteString(logEntry); err != nil {
 		log.Printf("[ERROR] Failed to write to log file: %v", err)
 		return err
@@ -149,7 +149,7 @@ func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
 	}
 	defer f.Close()
 
-	logEntry := fmt.Sprintf("[%s] Response from %s\n%s\n", timestamp, reqURL, string(dump))
+	logEntry := fmt.Sprintf("[%s] Response from %s\n%s\n\n", timestamp, reqURL, string(dump))
 
 	if _, err := f.WriteString(logEntry); err != nil {
 		log.Printf("[ERROR] Failed to write to log file: %v", err)

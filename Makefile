@@ -15,3 +15,6 @@ run:
 
 clean:
 	rm -f $(PROJECT_NAME)
+
+clean_logs:
+	rm -f logs/*.log
