@@ -1,4 +1,4 @@
-package go_ssh_proxy_logger
+package main
 
 import (
 	"context"
@@ -21,7 +21,7 @@ import (
 type SSHServer struct {
 	Name     string `yaml:"name"`
 	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
+	Port     string `yaml:"port"`
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	KeyFile  string `yaml:"key_file"`
@@ -124,7 +124,33 @@ func (s *Service) LogRequest(r *http.Request) error {
 	}
 	defer f.Close()
 
-	logEntry := fmt.Sprintf("[%s] \n%s\n", timestamp, string(dump))
+	logEntry := fmt.Sprintf("[%s] Request to %s\n%s\n", timestamp, r.URL.String(), string(dump))
+	if _, err := f.WriteString(logEntry); err != nil {
+		log.Printf("[ERROR] Failed to write to log file: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+
+	dump, err := httputil.DumpResponse(resp, true)
+	if err != nil {
+		log.Printf("[ERROR] Failed to dump response: %v", err)
+		return err
+	}
+
+	f, err := os.OpenFile(s.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[ERROR] Failed to open log file: %v", err)
+		return err
+	}
+	defer f.Close()
+
+	logEntry := fmt.Sprintf("[%s] Response from %s\n%s\n", timestamp, reqURL, string(dump))
+
 	if _, err := f.WriteString(logEntry); err != nil {
 		log.Printf("[ERROR] Failed to write to log file: %v", err)
 		return err
@@ -134,15 +160,16 @@ func (s *Service) LogRequest(r *http.Request) error {
 }
 
 func (s *Service) ListenPortOnSSH() {
-	sshConn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", s.SSHServer.Host, s.SSHServer.Port), s.SSHConfig)
+	log.Printf("Trying to listen on SSH server '%s'", s.SSHServerName)
+	sshConn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%s", s.SSHServer.Host, s.SSHServer.Port), s.SSHConfig)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Fail to connect to SSH: %v", err)
 	}
 	defer sshConn.Close()
 
-	listener, err := sshConn.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", s.SSHRemoteListenPort))
+	listener, err := sshConn.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", s.SSHRemoteListenPort))
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Fail to listen port on '0.0.0.0:%s': %v", s.SSHRemoteListenPort, err)
 	}
 	defer listener.Close()
 
@@ -156,7 +183,7 @@ func (s *Service) ListenPortOnSSH() {
 		Transport: transport,
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Receive request from %s\n", r.RemoteAddr)
 		err := s.LogRequest(r)
 		if err != nil {
@@ -186,6 +213,10 @@ func (s *Service) ListenPortOnSSH() {
 		}
 
 		resp, err := sshClient.Do(newReq)
+		errResp := s.LogResponse(resp, newReq.URL.String())
+		if errResp != nil {
+			log.Printf("[ERROR] Failed to log response: %v", errResp)
+		}
 		if err != nil {
 			log.Printf("[ERROR] Failed to send request: %s - %v", destUrl.String(), err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -207,8 +238,8 @@ func (s *Service) ListenPortOnSSH() {
 		}
 	})
 
-	log.Printf("Server listen: http://%s:%d\n", s.SSHServer.Host, s.SSHRemoteListenPort)
-	err = http.Serve(listener, nil)
+	log.Printf("Server listen: http://%s:%s\n", s.SSHServer.Host, s.SSHRemoteListenPort)
+	err = http.Serve(listener, mux)
 	if err != nil {
 		log.Fatal(err)
 	}
