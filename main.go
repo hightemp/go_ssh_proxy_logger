@@ -185,10 +185,6 @@ func (s *Service) ListenPortOnSSH() {
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Receive request from %s\n", r.RemoteAddr)
-		err := s.LogRequest(r)
-		if err != nil {
-			log.Fatal(err)
-		}
 
 		destUrl, err := url.Parse(s.DestUrl)
 		if err != nil {
@@ -212,8 +208,14 @@ func (s *Service) ListenPortOnSSH() {
 			}
 		}
 
+		err = s.LogRequest(newReq)
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		resp, err := sshClient.Do(newReq)
 		errResp := s.LogResponse(resp, newReq.URL.String())
+
 		if errResp != nil {
 			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
