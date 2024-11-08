@@ -1,2 +1,2 @@
 build:
-	go build main.go -o go_ssh_proxy_logger
+	go build -o go_ssh_proxy_logger main.go
