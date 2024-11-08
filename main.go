@@ -1,12 +1,14 @@
 package go_ssh_proxy_logger
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -85,12 +87,24 @@ func (s *Service) PrepareSSH() {
 		log.Fatalf("ssh server '%s' not found", s.SSHServerName)
 	}
 
-	s.SSHConfig = &ssh.ClientConfig{
-		User: sshserv.User,
-		Auth: []ssh.AuthMethod{
-			s.readPublicKeyFile(sshserv.KeyFile),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	if s.SSHServer.Password != "" {
+		s.SSHConfig = &ssh.ClientConfig{
+			User: s.SSHServer.User,
+			Auth: []ssh.AuthMethod{
+				ssh.PasswordCallback(func() (string, error) { return s.SSHServer.Password, nil }),
+			},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		}
+	} else if s.SSHServer.KeyFile != "" {
+		s.SSHConfig = &ssh.ClientConfig{
+			User: s.SSHServer.User,
+			Auth: []ssh.AuthMethod{
+				s.readPublicKeyFile(s.SSHServer.KeyFile),
+			},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		}
+	} else {
+		log.Fatalf("ssh server '%s' has no auth method", s.SSHServerName)
 	}
 }
 
@@ -120,21 +134,34 @@ func (s *Service) LogRequest(r *http.Request) error {
 }
 
 func (s *Service) ListenPortOnSSH() {
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", s.SSHServer.Host, s.SSHServer.Port), s.SSHConfig)
+	sshConn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", s.SSHServer.Host, s.SSHServer.Port), s.SSHConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer sshConn.Close()
 
-	listener, err := conn.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", s.SSHRemoteListenPort))
+	listener, err := sshConn.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", s.SSHRemoteListenPort))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
 
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return sshConn.DialContext(ctx, network, addr)
+		},
+	}
+
+	sshClient := &http.Client{
+		Transport: transport,
+	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Recieve request from %s\n", r.RemoteAddr)
-		s.LogRequest(r)
+		log.Printf("Receive request from %s\n", r.RemoteAddr)
+		err := s.LogRequest(r)
+		if err != nil {
+			log.Fatal(err)
+		}
 
 		destUrl, err := url.Parse(s.DestUrl)
 		if err != nil {
@@ -144,11 +171,21 @@ func (s *Service) ListenPortOnSSH() {
 		destUrl.Path = r.URL.Path
 		destUrl.RawQuery = r.URL.RawQuery
 		destUrl.Fragment = r.URL.Fragment
-		r.URL = destUrl
 
-		client := &http.Client{}
+		newReq, err := http.NewRequest(r.Method, destUrl.String(), r.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to create request: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-		resp, err := client.Do(r)
+		for key, values := range r.Header {
+			for _, value := range values {
+				newReq.Header.Add(key, value)
+			}
+		}
+
+		resp, err := sshClient.Do(newReq)
 		if err != nil {
 			log.Printf("[ERROR] Failed to send request: %s - %v", destUrl.String(), err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -179,6 +216,8 @@ func (s *Service) ListenPortOnSSH() {
 
 func (s *Service) Start(cfg *Config) {
 	s.Config = cfg
+	s.PrepareSSH()
+	s.ListenPortOnSSH()
 }
 
 func main() {
