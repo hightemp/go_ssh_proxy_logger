@@ -29,3 +29,5 @@ services:
     dest_url: "http://destination-service:8080"
     log_file: "logs/service1.log"
 ```
+
+![](https://asdertasd.site/counter/go_ssh_proxy_logger?a=1)
