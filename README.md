@@ -1,6 +1,6 @@
 # SSH Tunnel Proxy
 
-A Go application that creates HTTP proxies through SSH tunnels, allowing you to forward HTTP traffic through local server to specified destinations and logs all packets.
+A Go application that creates HTTP proxies through SSH tunnels, allowing you to forward HTTP traffic(MITM) through local server to specified destinations and logs all packets.
 
 ## Features
 
