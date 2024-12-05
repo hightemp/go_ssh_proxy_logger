@@ -2,10 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
-	"golang.org/x/crypto/ssh"
-	"gopkg.in/yaml.v3"
 	"io"
 	"log"
 	"net"
@@ -16,6 +15,9 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 type SSHServer struct {
@@ -177,6 +179,9 @@ func (s *Service) ListenPortOnSSH() {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return sshConn.DialContext(ctx, network, addr)
 		},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
 	}
 
 	sshClient := &http.Client{
@@ -214,15 +219,14 @@ func (s *Service) ListenPortOnSSH() {
 		}
 
 		resp, err := sshClient.Do(newReq)
-		errResp := s.LogResponse(resp, newReq.URL.String())
-
-		if errResp != nil {
-			log.Printf("[ERROR] Failed to log response: %v", errResp)
-		}
 		if err != nil {
 			log.Printf("[ERROR] Failed to send request: %s - %v", destUrl.String(), err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		errResp := s.LogResponse(resp, newReq.URL.String())
+		if errResp != nil {
+			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 		defer resp.Body.Close()
 
