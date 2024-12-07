@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -271,11 +272,22 @@ func (s *Service) ListenLocalPort() {
 		destUrl.RawQuery = r.URL.RawQuery
 		destUrl.Fragment = r.URL.Fragment
 
-		newReq, err := http.NewRequest(r.Method, destUrl.String(), r.Body)
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to read request body: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		newReq, err := http.NewRequest(r.Method, destUrl.String(), bytes.NewBuffer(bodyBytes))
 		if err != nil {
 			log.Printf("[ERROR] Failed to create request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		if r.ContentLength > 0 {
+			newReq.ContentLength = r.ContentLength
 		}
 
 		// Копируем заголовки из оригинального запроса
