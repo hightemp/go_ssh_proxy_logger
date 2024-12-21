@@ -188,16 +188,23 @@ func (s *Service) ListenPortOnSSH() {
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Receive request from %s\n", r.RemoteAddr)
 
-		destUrl, err := url.Parse(s.DestUrl)
-		if err != nil {
-			log.Fatal(err)
+		var newRequestURL string
+		if s.DestUrl != "" {
+			destUrl, err := url.Parse(s.DestUrl)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			destUrl.Path = r.URL.Path
+			destUrl.RawQuery = r.URL.RawQuery
+			destUrl.Fragment = r.URL.Fragment
+
+			newRequestURL = destUrl.String()
+		} else {
+			newRequestURL = r.URL.String()
 		}
 
-		destUrl.Path = r.URL.Path
-		destUrl.RawQuery = r.URL.RawQuery
-		destUrl.Fragment = r.URL.Fragment
-
-		newReq, err := http.NewRequest(r.Method, destUrl.String(), r.Body)
+		newReq, err := http.NewRequest(r.Method, newRequestURL, r.Body)
 		if err != nil {
 			log.Printf("[ERROR] Failed to create request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
