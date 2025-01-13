@@ -229,7 +229,7 @@ func (s *Service) ListenPortOnSSH() {
 			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 		if err != nil {
-			log.Printf("[ERROR] Failed to send request: %s - %v", destUrl.String(), err)
+			log.Printf("[ERROR] Failed to send request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -270,6 +270,57 @@ func (s *Service) ListenLocalPort() {
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request from %s\n", r.RemoteAddr)
 
+		if r.Method == http.MethodConnect {
+			host := r.URL.Host
+			if host == "" {
+				host = r.Host
+			}
+
+			targetConn, err := net.Dial("tcp", host)
+			if err != nil {
+				log.Printf("[ERROR] Failed to connect to target: %v", err)
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			defer targetConn.Close()
+
+			w.WriteHeader(http.StatusOK)
+
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				log.Printf("[ERROR] Hijacking not supported")
+				http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+				return
+			}
+
+			clientConn, _, err := hijacker.Hijack()
+			if err != nil {
+				log.Printf("[ERROR] Failed to hijack connection: %v", err)
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			defer clientConn.Close()
+
+			err = s.LogRequest(r)
+			if err != nil {
+				log.Printf("[ERROR] Failed to log CONNECT request: %v", err)
+			}
+
+			go func() {
+				_, err := io.Copy(targetConn, clientConn)
+				if err != nil {
+					log.Printf("[ERROR] Error copying to target: %v", err)
+				}
+			}()
+
+			_, err = io.Copy(clientConn, targetConn)
+			if err != nil {
+				log.Printf("[ERROR] Error copying to client: %v", err)
+			}
+
+			return
+		}
+
 		destUrl, err := url.Parse(s.DestUrl)
 		if err != nil {
 			log.Fatal(err)
@@ -297,7 +348,6 @@ func (s *Service) ListenLocalPort() {
 			newReq.ContentLength = r.ContentLength
 		}
 
-		// Копируем заголовки из оригинального запроса
 		for key, values := range r.Header {
 			for _, value := range values {
 				newReq.Header.Add(key, value)
@@ -322,7 +372,6 @@ func (s *Service) ListenLocalPort() {
 			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 
-		// Копируем заголовки ответа
 		for key, values := range resp.Header {
 			for _, value := range values {
 				w.Header().Add(key, value)
