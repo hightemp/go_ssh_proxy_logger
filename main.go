@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -179,9 +179,6 @@ func (s *Service) ListenPortOnSSH() {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return sshConn.DialContext(ctx, network, addr)
 		},
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
 	}
 
 	sshClient := &http.Client{
@@ -191,16 +188,23 @@ func (s *Service) ListenPortOnSSH() {
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Receive request from %s\n", r.RemoteAddr)
 
-		destUrl, err := url.Parse(s.DestUrl)
-		if err != nil {
-			log.Fatal(err)
+		var newRequestURL string
+		if s.DestUrl != "" {
+			destUrl, err := url.Parse(s.DestUrl)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			destUrl.Path = r.URL.Path
+			destUrl.RawQuery = r.URL.RawQuery
+			destUrl.Fragment = r.URL.Fragment
+
+			newRequestURL = destUrl.String()
+		} else {
+			newRequestURL = r.URL.String()
 		}
 
-		destUrl.Path = r.URL.Path
-		destUrl.RawQuery = r.URL.RawQuery
-		destUrl.Fragment = r.URL.Fragment
-
-		newReq, err := http.NewRequest(r.Method, destUrl.String(), r.Body)
+		newReq, err := http.NewRequest(r.Method, newRequestURL, r.Body)
 		if err != nil {
 			log.Printf("[ERROR] Failed to create request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -219,14 +223,15 @@ func (s *Service) ListenPortOnSSH() {
 		}
 
 		resp, err := sshClient.Do(newReq)
-		if err != nil {
-			log.Printf("[ERROR] Failed to send request: %s - %v", destUrl.String(), err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		errResp := s.LogResponse(resp, newReq.URL.String())
+
 		if errResp != nil {
 			log.Printf("[ERROR] Failed to log response: %v", errResp)
+		}
+		if err != nil {
+			log.Printf("[ERROR] Failed to send request: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		defer resp.Body.Close()
 
@@ -251,10 +256,103 @@ func (s *Service) ListenPortOnSSH() {
 	}
 }
 
+func (s *Service) ListenLocalPort() {
+	log.Printf("Starting local listener on port %s", s.SSHRemoteListenPort)
+
+	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%s", s.SSHRemoteListenPort))
+	if err != nil {
+		log.Fatalf("Failed to start local listener: %v", err)
+	}
+	defer listener.Close()
+
+	client := &http.Client{}
+
+	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("Received request from %s\n", r.RemoteAddr)
+
+		destUrl, err := url.Parse(s.DestUrl)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		destUrl.Path = r.URL.Path
+		destUrl.RawQuery = r.URL.RawQuery
+		destUrl.Fragment = r.URL.Fragment
+
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to read request body: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		newReq, err := http.NewRequest(r.Method, destUrl.String(), bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			log.Printf("[ERROR] Failed to create request: %v", err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if r.ContentLength > 0 {
+			newReq.ContentLength = r.ContentLength
+		}
+
+		// Копируем заголовки из оригинального запроса
+		for key, values := range r.Header {
+			for _, value := range values {
+				newReq.Header.Add(key, value)
+			}
+		}
+
+		err = s.LogRequest(newReq)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		resp, err := client.Do(newReq)
+		if err != nil {
+			log.Printf("[ERROR] Failed to send request: %s - %v", destUrl.String(), err)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		errResp := s.LogResponse(resp, newReq.URL.String())
+		if errResp != nil {
+			log.Printf("[ERROR] Failed to log response: %v", errResp)
+		}
+
+		// Копируем заголовки ответа
+		for key, values := range resp.Header {
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+
+		w.WriteHeader(resp.StatusCode)
+
+		_, err = io.Copy(w, resp.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to copy response body: %v", err)
+		}
+	})
+
+	log.Printf("Local server listening on http://localhost:%s\n", s.SSHRemoteListenPort)
+	err = http.Serve(listener, mux)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func (s *Service) Start(cfg *Config) {
 	s.Config = cfg
-	s.PrepareSSH()
-	s.ListenPortOnSSH()
+
+	if s.SSHServerName == "localhost" {
+		s.ListenLocalPort()
+	} else {
+		s.PrepareSSH()
+		s.ListenPortOnSSH()
+	}
 }
 
 func main() {
