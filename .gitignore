@@ -1,3 +1,4 @@
 config.yaml
 go_ssh_proxy_logger
 go_ssh_proxy_logger_static
+.idea
