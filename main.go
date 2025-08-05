@@ -136,6 +136,11 @@ func (s *Service) LogRequest(r *http.Request) error {
 }
 
 func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
+	if resp == nil {
+		log.Printf("[ERROR] Cannot log nil response")
+		return fmt.Errorf("response is nil")
+	}
+
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
 	dump, err := httputil.DumpResponse(resp, true)
@@ -223,15 +228,15 @@ func (s *Service) ListenPortOnSSH() {
 		}
 
 		resp, err := sshClient.Do(newReq)
-		errResp := s.LogResponse(resp, newReq.URL.String())
-
-		if errResp != nil {
-			log.Printf("[ERROR] Failed to log response: %v", errResp)
-		}
 		if err != nil {
 			log.Printf("[ERROR] Failed to send request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		errResp := s.LogResponse(resp, newReq.URL.String())
+		if errResp != nil {
+			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 		defer resp.Body.Close()
 
