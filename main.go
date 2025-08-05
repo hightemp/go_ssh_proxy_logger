@@ -35,6 +35,7 @@ type Service struct {
 	SSHRemoteListenPort string `yaml:"ssh_remote_listen_port"`
 	DestUrl             string `yaml:"dest_url"`
 	LogFile             string `yaml:"log_file"`
+	RequestMode         string `yaml:"request_mode"` // "ssh" или "direct", по умолчанию "ssh"
 	SSHServer           *SSHServer
 	Config              *Config
 	SSHConfig           *ssh.ClientConfig
@@ -180,14 +181,29 @@ func (s *Service) ListenPortOnSSH() {
 	}
 	defer listener.Close()
 
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return sshConn.DialContext(ctx, network, addr)
-		},
+	var client *http.Client
+
+	// Определяем режим отправки запросов
+	requestMode := s.RequestMode
+	if requestMode == "" {
+		requestMode = "ssh" // по умолчанию через SSH
 	}
 
-	sshClient := &http.Client{
-		Transport: transport,
+	if requestMode == "ssh" {
+		// Отправка через SSH туннель
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return sshConn.DialContext(ctx, network, addr)
+			},
+		}
+		client = &http.Client{
+			Transport: transport,
+		}
+		log.Printf("Service '%s' configured to send requests through SSH tunnel", s.Name)
+	} else {
+		// Прямая отправка запросов
+		client = &http.Client{}
+		log.Printf("Service '%s' configured to send requests directly", s.Name)
 	}
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +243,7 @@ func (s *Service) ListenPortOnSSH() {
 			log.Fatal(err)
 		}
 
-		resp, err := sshClient.Do(newReq)
+		resp, err := client.Do(newReq)
 		if err != nil {
 			log.Printf("[ERROR] Failed to send request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)

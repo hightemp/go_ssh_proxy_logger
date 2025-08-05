@@ -10,8 +10,10 @@ services:
     ssh_remote_listen_port: "9991"
     dest_url: "https://api.service1.net"
     log_file: "logs/stage__service1.log"
+    request_mode: "ssh"  # "ssh" (по умолчанию) или "direct"
   - name: "service2"
     ssh_server_name: "stage"
     ssh_remote_listen_port: "9992"
     dest_url: "https://service2.org:50443"
     log_file: "logs/stage__service2.log"
+    request_mode: "direct"  # отправка запросов напрямую с сервера
