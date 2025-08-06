@@ -28,11 +28,13 @@ services:
     ssh_remote_listen_port: "8080"
     dest_url: "http://destination-service:8080"
     log_file: "logs/service1.log"
+    request_mode: "ssh"
   - name: service2
     ssh_server_name: localhost
     ssh_remote_listen_port: "8081"
     dest_url: "http://destination-service-2:8080"
     log_file: "logs/service2.log"
+    request_mode: "direct"
 ```
 
 ![](https://asdertasd.site/counter/go_ssh_proxy_logger?a=1)
