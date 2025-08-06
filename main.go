@@ -35,6 +35,7 @@ type Service struct {
 	SSHRemoteListenPort string `yaml:"ssh_remote_listen_port"`
 	DestUrl             string `yaml:"dest_url"`
 	LogFile             string `yaml:"log_file"`
+	RequestMode         string `yaml:"request_mode"` // "ssh" или "direct", по умолчанию "ssh"
 	SSHServer           *SSHServer
 	Config              *Config
 	SSHConfig           *ssh.ClientConfig
@@ -136,6 +137,11 @@ func (s *Service) LogRequest(r *http.Request) error {
 }
 
 func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
+	if resp == nil {
+		log.Printf("[ERROR] Cannot log nil response")
+		return fmt.Errorf("response is nil")
+	}
+
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
 	dump, err := httputil.DumpResponse(resp, true)
@@ -175,14 +181,29 @@ func (s *Service) ListenPortOnSSH() {
 	}
 	defer listener.Close()
 
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return sshConn.DialContext(ctx, network, addr)
-		},
+	var client *http.Client
+
+	// Определяем режим отправки запросов
+	requestMode := s.RequestMode
+	if requestMode == "" {
+		requestMode = "ssh" // по умолчанию через SSH
 	}
 
-	sshClient := &http.Client{
-		Transport: transport,
+	if requestMode == "ssh" {
+		// Отправка через SSH туннель
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return sshConn.DialContext(ctx, network, addr)
+			},
+		}
+		client = &http.Client{
+			Transport: transport,
+		}
+		log.Printf("Service '%s' configured to send requests through SSH tunnel", s.Name)
+	} else {
+		// Прямая отправка запросов
+		client = &http.Client{}
+		log.Printf("Service '%s' configured to send requests directly", s.Name)
 	}
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -222,16 +243,16 @@ func (s *Service) ListenPortOnSSH() {
 			log.Fatal(err)
 		}
 
-		resp, err := sshClient.Do(newReq)
-		errResp := s.LogResponse(resp, newReq.URL.String())
-
-		if errResp != nil {
-			log.Printf("[ERROR] Failed to log response: %v", errResp)
-		}
+		resp, err := client.Do(newReq)
 		if err != nil {
 			log.Printf("[ERROR] Failed to send request: %v", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		errResp := s.LogResponse(resp, newReq.URL.String())
+		if errResp != nil {
+			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 		defer resp.Body.Close()
 
@@ -270,6 +291,7 @@ func (s *Service) ListenLocalPort() {
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request from %s\n", r.RemoteAddr)
 
+		// Обработка CONNECT метода для HTTP прокси
 		if r.Method == http.MethodConnect {
 			host := r.URL.Host
 			if host == "" {
@@ -348,6 +370,7 @@ func (s *Service) ListenLocalPort() {
 			newReq.ContentLength = r.ContentLength
 		}
 
+		// Копируем заголовки из оригинального запроса
 		for key, values := range r.Header {
 			for _, value := range values {
 				newReq.Header.Add(key, value)
@@ -372,6 +395,7 @@ func (s *Service) ListenLocalPort() {
 			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 
+		// Копируем заголовки ответа
 		for key, values := range resp.Header {
 			for _, value := range values {
 				w.Header().Add(key, value)
