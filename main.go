@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -46,6 +47,75 @@ type Config struct {
 	SSHServers []SSHServer `yaml:"ssh_servers"`
 }
 
+// SSHConnManager keeps one ssh.Client per SSH server name and serializes dials.
+type SSHConnManager struct {
+	mu      sync.Mutex
+	conns   map[string]*ssh.Client
+	dialing map[string]*dialState
+}
+
+type dialState struct {
+	ready chan struct{}
+	err   error
+}
+
+func NewSSHConnManager() *SSHConnManager {
+	return &SSHConnManager{
+		conns:   make(map[string]*ssh.Client),
+		dialing: make(map[string]*dialState),
+	}
+}
+
+var sshMgr = NewSSHConnManager()
+
+func (m *SSHConnManager) GetOrDial(name, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	m.mu.Lock()
+	if c, ok := m.conns[name]; ok && c != nil {
+		m.mu.Unlock()
+		return c, nil
+	}
+	if st, ok := m.dialing[name]; ok {
+		ch := st.ready
+		m.mu.Unlock()
+		<-ch
+		m.mu.Lock()
+		c := m.conns[name]
+		err := st.err
+		m.mu.Unlock()
+		if c != nil {
+			return c, nil
+		}
+		return nil, err
+	}
+	st := &dialState{ready: make(chan struct{})}
+	m.dialing[name] = st
+	m.mu.Unlock()
+
+	c, err := ssh.Dial("tcp", addr, cfg)
+
+	m.mu.Lock()
+	if err == nil {
+		m.conns[name] = c
+	}
+	st.err = err
+	delete(m.dialing, name)
+	close(st.ready)
+	m.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (m *SSHConnManager) Invalidate(name string, client *ssh.Client) {
+	m.mu.Lock()
+	if c, ok := m.conns[name]; ok && c == client {
+		delete(m.conns, name)
+	}
+	m.mu.Unlock()
+}
+
 func loadConfig(filePath string) (*Config, error) {
 	bytes, err := os.ReadFile(filePath)
 	if err != nil {
@@ -63,9 +133,9 @@ func loadConfig(filePath string) (*Config, error) {
 }
 
 func (c *Config) FindSSHServerByName(name string) *SSHServer {
-	for _, srv := range c.SSHServers {
-		if srv.Name == name {
-			return &srv
+	for i := range c.SSHServers {
+		if c.SSHServers[i].Name == name {
+			return &c.SSHServers[i]
 		}
 	}
 	return nil
@@ -114,7 +184,24 @@ func (s *Service) PrepareSSH() {
 func (s *Service) LogRequest(r *http.Request) error {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
-	dump, err := httputil.DumpRequest(r, true)
+	// Preserve and clone body so downstream send still has the content
+	var bodyBytes []byte
+	var err error
+	if r.Body != nil {
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to read request body for logging: %v", err)
+			return err
+		}
+	}
+	// Restore original request body for further processing
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Create a copy for dumping so DumpRequest won't consume the live body
+	reqCopy := r.Clone(r.Context())
+	reqCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	dump, err := httputil.DumpRequest(reqCopy, true)
 	if err != nil {
 		log.Printf("[ERROR] Failed to dump request: %v", err)
 		return err
@@ -144,7 +231,25 @@ func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
-	dump, err := httputil.DumpResponse(resp, true)
+	// Preserve and clone body so handler can still stream it to the client
+	var bodyBytes []byte
+	var err error
+	if resp.Body != nil {
+		bodyBytes, err = io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("[ERROR] Failed to read response body for logging: %v", err)
+			return err
+		}
+	}
+	// Restore original response body for further processing
+	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Create a copy for dumping so DumpResponse won't consume the live body
+	respCopy := new(http.Response)
+	*respCopy = *resp
+	respCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	dump, err := httputil.DumpResponse(respCopy, true)
 	if err != nil {
 		log.Printf("[ERROR] Failed to dump response: %v", err)
 		return err
@@ -168,112 +273,149 @@ func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
 }
 
 func (s *Service) ListenPortOnSSH() {
-	log.Printf("Trying to listen on SSH server '%s'", s.SSHServerName)
-	sshConn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%s", s.SSHServer.Host, s.SSHServer.Port), s.SSHConfig)
-	if err != nil {
-		log.Fatalf("Fail to connect to SSH: %v", err)
-	}
-	defer sshConn.Close()
+	addr := fmt.Sprintf("%s:%s", s.SSHServer.Host, s.SSHServer.Port)
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
 
-	listener, err := sshConn.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", s.SSHRemoteListenPort))
-	if err != nil {
-		log.Fatalf("Fail to listen port on '0.0.0.0:%s': %v", s.SSHRemoteListenPort, err)
-	}
-	defer listener.Close()
+	for {
+		log.Printf("Trying to listen on SSH server '%s'", s.SSHServerName)
 
-	var client *http.Client
-
-	// Определяем режим отправки запросов
-	requestMode := s.RequestMode
-	if requestMode == "" {
-		requestMode = "ssh" // по умолчанию через SSH
-	}
-
-	if requestMode == "ssh" {
-		// Отправка через SSH туннель
-		transport := &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return sshConn.DialContext(ctx, network, addr)
-			},
-		}
-		client = &http.Client{
-			Transport: transport,
-		}
-		log.Printf("Service '%s' configured to send requests through SSH tunnel", s.Name)
-	} else {
-		// Прямая отправка запросов
-		client = &http.Client{}
-		log.Printf("Service '%s' configured to send requests directly", s.Name)
-	}
-
-	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Receive request from %s\n", r.RemoteAddr)
-
-		var newRequestURL string
-		if s.DestUrl != "" {
-			destUrl, err := url.Parse(s.DestUrl)
-			if err != nil {
-				log.Fatal(err)
+		sshConn, err := sshMgr.GetOrDial(s.SSHServerName, addr, s.SSHConfig)
+		if err != nil {
+			log.Printf("[WARN] Fail to connect to SSH '%s': %v (retry in %s)", s.SSHServerName, err, backoff)
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 			}
+			continue
+		}
 
-			destUrl.Path = r.URL.Path
-			destUrl.RawQuery = r.URL.RawQuery
-			destUrl.Fragment = r.URL.Fragment
+		listener, err := sshConn.Listen("tcp", fmt.Sprintf("0.0.0.0:%s", s.SSHRemoteListenPort))
+		if err != nil {
+			log.Printf("[WARN] Fail to listen port on '0.0.0.0:%s': %v (retry in %s)", s.SSHRemoteListenPort, err, backoff)
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+			}
+			continue
+		}
 
-			newRequestURL = destUrl.String()
+		// Successfully started listener; reset backoff
+		backoff = 1 * time.Second
+
+		var client *http.Client
+
+		// Определяем режим отправки запросов
+		requestMode := s.RequestMode
+		if requestMode == "" {
+			requestMode = "ssh" // по умолчанию через SSH
+		}
+
+		if requestMode == "ssh" {
+			// Отправка через SSH туннель
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return sshConn.DialContext(ctx, network, addr)
+				},
+			}
+			client = &http.Client{
+				Transport: transport,
+			}
+			log.Printf("Service '%s' configured to send requests through SSH tunnel", s.Name)
 		} else {
-			newRequestURL = r.URL.String()
+			// Прямая отправка запросов
+			client = &http.Client{}
+			log.Printf("Service '%s' configured to send requests directly", s.Name)
 		}
 
-		newReq, err := http.NewRequest(r.Method, newRequestURL, r.Body)
-		if err != nil {
-			log.Printf("[ERROR] Failed to create request: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("Receive request from %s\n", r.RemoteAddr)
 
-		for key, values := range r.Header {
-			for _, value := range values {
-				newReq.Header.Add(key, value)
+			var newRequestURL string
+			if s.DestUrl != "" {
+				destUrl, err := url.Parse(s.DestUrl)
+				if err != nil {
+					log.Printf("[ERROR] Bad dest_url for service '%s': %v", s.Name, err)
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+
+				destUrl.Path = r.URL.Path
+				destUrl.RawQuery = r.URL.RawQuery
+				destUrl.Fragment = r.URL.Fragment
+
+				newRequestURL = destUrl.String()
+			} else {
+				newRequestURL = r.URL.String()
 			}
-		}
 
-		err = s.LogRequest(newReq)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		resp, err := client.Do(newReq)
-		if err != nil {
-			log.Printf("[ERROR] Failed to send request: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		errResp := s.LogResponse(resp, newReq.URL.String())
-		if errResp != nil {
-			log.Printf("[ERROR] Failed to log response: %v", errResp)
-		}
-		defer resp.Body.Close()
-
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
+			// Read body to allow logging and resend
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				log.Printf("[ERROR] Failed to read request body: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
+
+			newReq, err := http.NewRequest(r.Method, newRequestURL, bytes.NewBuffer(bodyBytes))
+			if err != nil {
+				log.Printf("[ERROR] Failed to create request: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			if r.ContentLength > 0 {
+				newReq.ContentLength = r.ContentLength
+			}
+
+			for key, values := range r.Header {
+				for _, value := range values {
+					newReq.Header.Add(key, value)
+				}
+			}
+
+			if err := s.LogRequest(newReq); err != nil {
+				log.Printf("[ERROR] Failed to log request: %v", err)
+			}
+
+			resp, err := client.Do(newReq)
+			if err != nil {
+				log.Printf("[ERROR] Failed to send request: %v", err)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer resp.Body.Close()
+
+			if errResp := s.LogResponse(resp, newReq.URL.String()); errResp != nil {
+				log.Printf("[ERROR] Failed to log response: %v", errResp)
+			}
+
+			for key, values := range resp.Header {
+				for _, value := range values {
+					w.Header().Add(key, value)
+				}
+			}
+
+			w.WriteHeader(resp.StatusCode)
+
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				log.Printf("[ERROR] Failed to copy response body: %v", err)
+			}
+		})
+
+		log.Printf("Server listen: http://%s:%s\n", s.SSHServer.Host, s.SSHRemoteListenPort)
+		if err := http.Serve(listener, mux); err != nil {
+			log.Printf("[WARN] HTTP serve on %s:%s stopped: %v", s.SSHServer.Host, s.SSHRemoteListenPort, err)
 		}
 
-		w.WriteHeader(resp.StatusCode)
-
-		_, err = io.Copy(w, resp.Body)
-		if err != nil {
-			log.Printf("[ERROR] Failed to copy response body: %v", err)
-		}
-	})
-
-	log.Printf("Server listen: http://%s:%s\n", s.SSHServer.Host, s.SSHRemoteListenPort)
-	err = http.Serve(listener, mux)
-	if err != nil {
-		log.Fatal(err)
+		// If we got here, listener/connection likely dropped. Invalidate and retry.
+		sshMgr.Invalidate(s.SSHServerName, sshConn)
 	}
 }
 
