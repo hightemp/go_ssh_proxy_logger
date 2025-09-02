@@ -36,7 +36,7 @@ type Service struct {
 	SSHRemoteListenPort string `yaml:"ssh_remote_listen_port"`
 	DestUrl             string `yaml:"dest_url"`
 	LogFile             string `yaml:"log_file"`
-	RequestMode         string `yaml:"request_mode"` // "ssh" или "direct", по умолчанию "ssh"
+	RequestMode         string `yaml:"request_mode"`
 	SSHServer           *SSHServer
 	Config              *Config
 	SSHConfig           *ssh.ClientConfig
@@ -47,7 +47,6 @@ type Config struct {
 	SSHServers []SSHServer `yaml:"ssh_servers"`
 }
 
-// SSHConnManager keeps one ssh.Client per SSH server name and serializes dials.
 type SSHConnManager struct {
 	mu      sync.Mutex
 	conns   map[string]*ssh.Client
@@ -184,7 +183,6 @@ func (s *Service) PrepareSSH() {
 func (s *Service) LogRequest(r *http.Request) error {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
-	// Preserve and clone body so downstream send still has the content
 	var bodyBytes []byte
 	var err error
 	if r.Body != nil {
@@ -194,10 +192,9 @@ func (s *Service) LogRequest(r *http.Request) error {
 			return err
 		}
 	}
-	// Restore original request body for further processing
+
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	// Create a copy for dumping so DumpRequest won't consume the live body
 	reqCopy := r.Clone(r.Context())
 	reqCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
@@ -231,7 +228,6 @@ func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 
-	// Preserve and clone body so handler can still stream it to the client
 	var bodyBytes []byte
 	var err error
 	if resp.Body != nil {
@@ -241,10 +237,9 @@ func (s *Service) LogResponse(resp *http.Response, reqURL string) error {
 			return err
 		}
 	}
-	// Restore original response body for further processing
+
 	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	// Create a copy for dumping so DumpResponse won't consume the live body
 	respCopy := new(http.Response)
 	*respCopy = *resp
 	respCopy.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
@@ -306,19 +301,17 @@ func (s *Service) ListenPortOnSSH() {
 			continue
 		}
 
-		// Successfully started listener; reset backoff
 		backoff = 1 * time.Second
 
 		var client *http.Client
 
-		// Определяем режим отправки запросов
 		requestMode := s.RequestMode
 		if requestMode == "" {
-			requestMode = "ssh" // по умолчанию через SSH
+			requestMode = "ssh"
 		}
 
 		if requestMode == "ssh" {
-			// Отправка через SSH туннель
+
 			transport := &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					return sshConn.DialContext(ctx, network, addr)
@@ -329,7 +322,7 @@ func (s *Service) ListenPortOnSSH() {
 			}
 			log.Printf("Service '%s' configured to send requests through SSH tunnel", s.Name)
 		} else {
-			// Прямая отправка запросов
+
 			client = &http.Client{}
 			log.Printf("Service '%s' configured to send requests directly", s.Name)
 		}
@@ -355,7 +348,6 @@ func (s *Service) ListenPortOnSSH() {
 				newRequestURL = r.URL.String()
 			}
 
-			// Read body to allow logging and resend
 			bodyBytes, err := io.ReadAll(r.Body)
 			if err != nil {
 				log.Printf("[ERROR] Failed to read request body: %v", err)
@@ -414,7 +406,6 @@ func (s *Service) ListenPortOnSSH() {
 			log.Printf("[WARN] HTTP serve on %s:%s stopped: %v", s.SSHServer.Host, s.SSHRemoteListenPort, err)
 		}
 
-		// If we got here, listener/connection likely dropped. Invalidate and retry.
 		sshMgr.Invalidate(s.SSHServerName, sshConn)
 	}
 }
@@ -433,7 +424,6 @@ func (s *Service) ListenLocalPort() {
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request from %s\n", r.RemoteAddr)
 
-		// Обработка CONNECT метода для HTTP прокси
 		if r.Method == http.MethodConnect {
 			host := r.URL.Host
 			if host == "" {
@@ -512,7 +502,6 @@ func (s *Service) ListenLocalPort() {
 			newReq.ContentLength = r.ContentLength
 		}
 
-		// Копируем заголовки из оригинального запроса
 		for key, values := range r.Header {
 			for _, value := range values {
 				newReq.Header.Add(key, value)
@@ -537,7 +526,6 @@ func (s *Service) ListenLocalPort() {
 			log.Printf("[ERROR] Failed to log response: %v", errResp)
 		}
 
-		// Копируем заголовки ответа
 		for key, values := range resp.Header {
 			for _, value := range values {
 				w.Header().Add(key, value)
