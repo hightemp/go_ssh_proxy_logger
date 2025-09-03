@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -31,15 +32,16 @@ type SSHServer struct {
 }
 
 type Service struct {
-	Name                string `yaml:"name"`
-	SSHServerName       string `yaml:"ssh_server_name"`
-	SSHRemoteListenPort string `yaml:"ssh_remote_listen_port"`
-	DestUrl             string `yaml:"dest_url"`
-	LogFile             string `yaml:"log_file"`
-	RequestMode         string `yaml:"request_mode"`
-	SSHServer           *SSHServer
-	Config              *Config
-	SSHConfig           *ssh.ClientConfig
+	Name                  string `yaml:"name"`
+	SSHServerName         string `yaml:"ssh_server_name"`
+	SSHRemoteListenPort   string `yaml:"ssh_remote_listen_port"`
+	DestUrl               string `yaml:"dest_url"`
+	LogFile               string `yaml:"log_file"`
+	RequestMode           string `yaml:"request_mode"`
+	TLSInsecureSkipVerify bool   `yaml:"tls_insecure_skip_verify"`
+	SSHServer             *SSHServer
+	Config                *Config
+	SSHConfig             *ssh.ClientConfig
 }
 
 type Config struct {
@@ -313,6 +315,9 @@ func (s *Service) ListenPortOnSSH() {
 		if requestMode == "ssh" {
 
 			transport := &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: s.TLSInsecureSkipVerify,
+				},
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					return sshConn.DialContext(ctx, network, addr)
 				},
@@ -323,7 +328,14 @@ func (s *Service) ListenPortOnSSH() {
 			log.Printf("Service '%s' configured to send requests through SSH tunnel", s.Name)
 		} else {
 
-			client = &http.Client{}
+			transport := &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: s.TLSInsecureSkipVerify,
+				},
+			}
+			client = &http.Client{
+				Transport: transport,
+			}
 			log.Printf("Service '%s' configured to send requests directly", s.Name)
 		}
 
@@ -419,7 +431,14 @@ func (s *Service) ListenLocalPort() {
 	}
 	defer listener.Close()
 
-	client := &http.Client{}
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: s.TLSInsecureSkipVerify,
+		},
+	}
+	client := &http.Client{
+		Transport: transport,
+	}
 
 	mux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received request from %s\n", r.RemoteAddr)
